@@ -1,0 +1,25 @@
+# Environnements virtuels
+.venv/
+venv/
+
+# Fichiers Python compilés
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Bases de données locales et fichiers de cache
+*.db
+*.sqlite
+*.log
+
+# Dépendances installées
+env/
+*.egg-info/
+
+# Configurations spécifiques à l'éditeur
+.vscode/
+.idea/
+
+# Dossiers de stockage de ChromaDB
+chroma_db/
