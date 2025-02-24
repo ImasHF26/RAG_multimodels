@@ -1,0 +1,7 @@
+streamlit
+fastapi
+uvicorn
+sentence-transformers
+chromadb
+requests
+ollama
