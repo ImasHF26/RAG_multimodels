@@ -64,15 +64,10 @@ def extract_text_from_file(file_path: str) -> str:
             with open(file_path, "rb") as f:
                 pdf_reader = PyPDF2.PdfReader(f)
                 text = ""
-                for page_num, page in enumerate(pdf_reader.pages, 1):
+                for page in pdf_reader.pages:
                     extracted = page.extract_text()
-                    logger.debug(f"Page {page_num}: Type of extracted = {type(extracted)}, Value = {extracted[:100]}...")
                     if isinstance(extracted, str):
                         text += extracted + "\n"
-                    elif isinstance(extracted, (list, np.ndarray)):
-                        text += " ".join(map(str, extracted)) + "\n"
-                    elif extracted is not None:
-                        text += str(extracted) + "\n"
                 return text.strip() or ""
         elif extension == "csv":
             df = pd.read_csv(file_path)
@@ -113,21 +108,19 @@ def check_overlap(new_chunk: str, existing_embeddings: List[List[float]], thresh
     model = load_embedding_model()
     try:
         new_embedding = model.encode(new_chunk, convert_to_numpy=True)
-        logger.debug(f"Checking overlap for chunk: {new_chunk[:50]}... Shape of new_embedding: {new_embedding.shape}")
         for existing_emb in existing_embeddings:
-            existing_emb_array = np.array(existing_emb).reshape(1, -1)
-            similarity = cosine_similarity(new_embedding.reshape(1, -1), existing_emb_array)[0][0]
-            logger.debug(f"Similarity calculated: {similarity}")
+            similarity = cosine_similarity(new_embedding.reshape(1, -1), np.array(existing_emb).reshape(1, -1))[0][0]
             if similarity >= threshold:
                 logger.debug(f"Overlap detected: similarity = {similarity}")
                 return True
         return False
     except Exception as e:
-        logger.error(f"Erreur dans check_overlap pour chunk {new_chunk[:50]}... : {str(e)}")
+        logger.error(f"Erreur dans check_overlap : {str(e)}")
         raise ValueError(f"Erreur dans check_overlap : {str(e)}")
 
 # Insertion d'un fichier texte dans ChromaDB
-def insert_text_file_into_chroma(file_path: str, chunk_size: int = 500) -> dict:
+# Dans app/models.py
+def insert_text_file_into_chroma(file_path: str, chunk_size: int = 500, domaine: str = None, theme: str = None, filename: str = None, size: float = None, date: str = None) -> dict:
     is_valid, validation_message = validate_file(file_path)
     if not is_valid:
         return {"success": False, "message": validation_message}
@@ -139,9 +132,8 @@ def insert_text_file_into_chroma(file_path: str, chunk_size: int = 500) -> dict:
     
     try:
         text = extract_text_from_file(file_path)
-        logger.debug(f"Extracted text length: {len(text)}, Type: {type(text)}")
         if not isinstance(text, str) or not text.strip():
-            return {"success": False, "message": f"Le fichier {file_path} ne contient aucun texte exploitable ou type invalide."}
+            return {"success": False, "message": f"Le fichier {file_path} ne contient aucun texte exploitable."}
     except ValueError as e:
         return {"success": False, "message": str(e)}
     
@@ -151,86 +143,119 @@ def insert_text_file_into_chroma(file_path: str, chunk_size: int = 500) -> dict:
     
     doc_ids, documents, embeddings, metadatas = [], [], [], []
     all_existing = collection.get(include=["embeddings"])
-    existing_embeddings = all_existing["embeddings"] if (all_existing["embeddings"] is not None and len(all_existing["embeddings"]) > 0) else []    
-    logger.debug(f"Number of existing embeddings: {len(existing_embeddings)}")
+    existing_embeddings = all_existing["embeddings"] if all_existing["embeddings"] is not None else []
     
     model = load_embedding_model()
     for i, chunk in enumerate(chunks):
-        logger.debug(f"Processing chunk {i}: {chunk[:50]}...")
-        if len(existing_embeddings) > 0:
-            try:
-                overlap = check_overlap(chunk, existing_embeddings)
-                if overlap:
-                    logger.debug(f"Skipping chunk {i} due to overlap")
-                    continue
-            except ValueError as e:
-                logger.error(f"Erreur lors de la vérification de chevauchement pour chunk {i}: {str(e)}")
-                continue  # Ignorer ce chunk et continuer avec le suivant
+        if existing_embeddings is not None and len(existing_embeddings) > 0 and check_overlap(chunk, existing_embeddings):
+            logger.debug(f"Skipping chunk {i} due to overlap")
+            continue
         
         try:
             chunk_embedding = model.encode(chunk, batch_size=32, convert_to_numpy=True)
-            logger.debug(f"Chunk {i}: Type of embedding = {type(chunk_embedding)}, Shape = {chunk_embedding.shape}")
             doc_id = str(uuid.uuid4())
             doc_ids.append(doc_id)
             documents.append(chunk)
-            embeddings.append(chunk_embedding.tolist())  # Convertir en liste pour ChromaDB
-            metadatas.append({
+            embeddings.append(chunk_embedding.tolist())
+            metadata = {
                 "source": file_path,
                 "file_hash": file_hash,
                 "chunk_index": i,
                 "total_chunks": len(chunks)
-            })
+            }
+            if domaine:
+                metadata["domaine"] = domaine
+            if theme:
+                metadata["theme"] = theme
+            if filename:
+                metadata["filename"] = filename
+            if size is not None:  # Ajout de la taille
+                metadata["size"] = size
+            if date:  # Ajout de la date
+                metadata["date"] = date
+            metadatas.append(metadata)
         except Exception as e:
             logger.error(f"Erreur lors de l'encodage du chunk {i}: {str(e)}")
-            continue  # Ignorer ce chunk et continuer avec le suivant
+            continue
     
     if not doc_ids:
-        return {"success": False, "message": "Aucun nouveau contenu ajouté (chevauchement détecté)."}
+        return {"success": False, "message": "Aucun nouveau contenu ajouté (chevauchement détecté ou erreur)."}
     
     try:
-        logger.debug(f"Adding {len(doc_ids)} documents to ChromaDB")
         collection.add(ids=doc_ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
         indexed_docs = collection.get(ids=doc_ids, include=["documents"])
-        logger.debug(f"Indexed documents retrieved: {len(indexed_docs['documents'])}")
-        if not indexed_docs["documents"] or len(indexed_docs['documents']) != len(doc_ids):
-            return {"success": False, "message": f"Échec de l'indexation pour {file_path}. Données non trouvées dans ChromaDB."}
+        if not indexed_docs["documents"] or len(indexed_docs["documents"]) != len(doc_ids):
+            return {"success": False, "message": f"Échec de l'indexation pour {file_path}."}
         
         return {
             "success": True,
-            "message": f"Le fichier {file_path} a été validé et indexé avec succès.",
+            "message": f"Le fichier {file_path} a été indexé avec succès.",
             "chunks_created": len(chunks),
-            "chunks_indexed": len(doc_ids)
+            "chunks_indexed": len(doc_ids),
+            "domaine": domaine,
+            "theme": theme,
+            "filename": filename
         }
     except Exception as e:
-        logger.error(f"Erreur dans insert_text_file_into_chroma pour {file_path} : {str(e)}")
+        logger.error(f"Erreur dans insert_text_file_into_chroma : {str(e)}")
         return {"success": False, "message": f"Erreur lors de l'indexation : {str(e)}"}
 
-# Recherche avec reranking
-def search_with_reranking(query: str, top_k: int = 3) -> List[Dict]:
+# Recherche avec reranking et filtres
+def search_with_reranking_and_filters(query: str, top_k: int = 3, filters: dict = None) -> List[Dict]:
     model = load_embedding_model()
     try:
         query_embedding = model.encode(query, convert_to_numpy=True).tolist()
     except Exception as e:
         logger.error(f"Erreur lors de l'encodage de la requête : {str(e)}")
         raise ValueError(f"Erreur lors de l'encodage de la requête : {str(e)}")
-    results = collection.query(query_embeddings=[query_embedding], n_results=top_k * 2)
-    if "documents" not in results or not results["documents"]:
+    
+    # Construire la clause where pour les filtres
+    where_clause = {}
+    if filters:
+        for key, value in filters.items():
+            if value:  # Ignorer les valeurs vides
+                where_clause[key] = value
+    
+    # Effectuer la recherche avec les filtres si présents
+    if where_clause:
+        results = collection.query(
+            query_embeddings=[query_embedding], 
+            n_results=top_k * 2,
+            where=where_clause
+        )
+    else:
+        results = collection.query(
+            query_embeddings=[query_embedding], 
+            n_results=top_k * 2
+        )
+    
+    if not results.get("documents"):
         logger.info("Aucun résultat trouvé pour la requête.")
         return []
+    
     docs = results["documents"][0]
     metas = results["metadatas"][0]
     distances = results["distances"][0]
+    
     ranked_results = [
         {"text": doc, "metadata": meta, "distance": dist}
         for doc, meta, dist in zip(docs, metas, distances)
     ]
+    
     return sorted(ranked_results, key=lambda x: x["distance"])[:top_k]
 
+# Recherche simple (pour compatibilité avec l'ancien code)
+def search_with_reranking(query: str, top_k: int = 3) -> List[Dict]:
+    return search_with_reranking_and_filters(query, top_k)
+
 # Génération de réponse
-def generate_response(query: str, context: List[Dict], model: str = "qwen2:1.5b") -> str:
+def generate_response(query: str, context: List[Dict], model: str = "qwen2.5:3b") -> str:
     if not isinstance(context, list):
         raise ValueError(f"Context doit être une liste, reçu : {type(context)}")
-    context_text = "\n".join([item["text"] for item in context if "text" in item])
+    context_text = "\n".join([
+        f"{item['text']} (Source: {item['metadata']['source']}, Domaine: {item['metadata'].get('domaine', 'N/A')}, Thème: {item['metadata'].get('theme', 'N/A')}, Fichier: {item['metadata'].get('filename', 'N/A')})"
+        for item in context if "text" in item and "metadata" in item
+    ])
     prompt = f"Contexte : {context_text}\n\nQuestion : {query}\nInstruction : Répondez uniquement en vous basant sur le contexte fourni. Indiquez la source si possible. Ne rajoutez aucune information externe. Répondez toujours en français.\nRéponse :"
     response = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])["message"]["content"]
     return response

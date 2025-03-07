@@ -1,0 +1,303 @@
+import streamlit as st
+from streamlit_chat import message  # Import du composant de chat
+import requests
+import os
+import json
+from app.models import insert_text_file_into_chroma, collection  # Import de la collection ChromaDB
+from app.chatbot import chat_with_bot
+import logging
+import time
+
+# Désactiver les logs de débogage d'asyncio
+logging.getLogger('asyncio').setLevel(logging.WARNING)
+
+# Configuration du logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration de la page
+st.set_page_config(page_title="SH Chatbot - Recherche Augmentée", layout="wide", initial_sidebar_state="auto")
+
+# CSS personnalisé optimisé
+st.markdown("""
+    <style>
+    .history-container { 
+        border: 1px solid #ccc; 
+        padding: 10px; 
+        border-radius: 5px; 
+        background-color: #f9f9f9; 
+        height: 50px; 
+        overflow-y: auto; 
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+    }
+    .chat-container { 
+        height: 50px; 
+        overflow-y: auto; 
+        padding: 10px; 
+        border: 1px solid #ccc; 
+        border-radius: 5px; 
+        background-color: #ffffff; 
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+    }
+    .stChatMessage { 
+        margin: 5px 0; 
+        padding: 10px; 
+        border-radius: 8px; 
+        max-width: 80%; 
+        word-wrap: break-word; 
+        overflow-wrap: break-word; 
+    }
+    .stChatMessage.user { 
+        background-color: #e0f7fa; 
+        align-self: flex-end; 
+    }
+    .stChatMessage.bot { 
+        background-color: #f1f8e9; 
+        align-self: flex-start; 
+    }
+    .dark-mode .chat-container { 
+        background-color: #2d2d2d; 
+        border-color: #555; 
+    }
+    .dark-mode .history-container { 
+        background-color: #2d2d2d; 
+        border-color: #555; 
+    }
+    .dark-mode .stChatMessage.user { 
+        background-color: #4dd0e1; 
+        color: #000; 
+    }
+    .dark-mode .stChatMessage.bot { 
+        background-color: #aed581; 
+        color: #000; 
+    }
+    .dark-mode { 
+        background-color: #1e1e1e; 
+        color: #fff; 
+    }
+    [data-testid="stApp"] { 
+        max-height: 900px !important; 
+        overflow-y: auto !important; 
+    }
+    [data-testid="column"] { 
+        max-height: 100% !important; 
+        overflow-y: auto !important; 
+    }
+    .chat-container::-webkit-scrollbar, 
+    .history-container::-webkit-scrollbar { 
+        width: 8px; 
+    }
+    .chat-container::-webkit-scrollbar-thumb, 
+    .history-container::-webkit-scrollbar-thumb { 
+        background: #888; 
+        border-radius: 4px; 
+    }
+    .stTextInput > div > input { 
+        border-radius: 8px; 
+        padding: 8px; 
+    }
+    .stButton > button { 
+        background-color: #ff4444; 
+        color: white; 
+        border-radius: 8px; 
+        padding: 8px 16px; 
+        border: none; 
+        font-weight: bold; 
+    }
+    .stButton > button:hover { 
+        background-color: #cc0000; 
+    }
+    .popup-container { 
+        background: #fff; 
+        padding: 20px; 
+        border: 1px solid #ccc; 
+        border-radius: 10px; 
+        margin-top: 10px; 
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🤖 SH Chatbot - Recherche Augmentée")
+st.markdown("Posez vos questions et enrichissez la base de connaissances avec vos propres fichiers !")
+
+# Initialisation des états de session
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
+if "last_query" not in st.session_state:
+    st.session_state.last_query = None
+if "model" not in st.session_state:
+    st.session_state.model = "qwen2.5:3b"
+if "show_upload_popup" not in st.session_state:
+    st.session_state.show_upload_popup = False
+
+# Fonction pour récupérer les domaines et thèmes uniques depuis ChromaDB
+def get_unique_domains_and_themes():
+    all_docs = collection.get(include=["metadatas"])
+    domains = set()
+    themes = set()
+    if all_docs["metadatas"]:
+        for metadata in all_docs["metadatas"]:
+            if "domaine" in metadata:
+                domains.add(metadata["domaine"])
+            if "theme" in metadata:
+                themes.add(metadata["theme"])
+    return sorted(list(domains)), sorted(list(themes))
+
+# Récupérer les domaines et thèmes dynamiques
+unique_domains, unique_themes = get_unique_domains_and_themes()
+
+# Bouton pour afficher/masquer la section d'importation
+if st.button("📂 Importer un fichier"):
+    st.session_state.show_upload_popup = not st.session_state.show_upload_popup
+
+# Section d'importation (affichée conditionnellement)
+if st.session_state.show_upload_popup:
+    with st.container():
+        st.markdown('<div class="popup-container">', unsafe_allow_html=True)
+        st.subheader("Importer un fichier")
+        uploaded_file = st.file_uploader("Choisissez un fichier (.txt, .docx, .csv, .pdf, .json)", type=["txt", "docx", "csv", "pdf", "json"], key="popup_uploader")
+        if uploaded_file:
+            col_domaine, col_theme = st.columns(2)
+            with col_domaine:
+                domaine = st.selectbox("Domaine :", ["Nouveau"] + unique_domains, key="popup_domaine")
+                if domaine == "Nouveau":
+                    domaine = st.text_input("Domaine personnalisé :", key="popup_custom_domaine")
+            with col_theme:
+                theme = st.selectbox("Thème :", ["Nouveau"] + unique_themes, key="popup_theme")
+                if theme == "Nouveau":
+                    theme = st.text_input("Thème personnalisé :", key="popup_custom_theme")
+            if st.button("📤 Indexer", key="popup_index"):
+                file_path = f"temp_{uploaded_file.name}"
+                with st.spinner("Validation et indexation du fichier..."):
+                    try:
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        result = insert_text_file_into_chroma(file_path, domaine=domaine, theme=theme, filename=uploaded_file.name)
+                        if result["success"]:
+                            st.success(f"{result['message']} ({result['chunks_indexed']} chunks indexés sur {result['chunks_created']} créés)\nDomaine: {domaine}, Thème: {theme}")
+                            st.session_state.show_upload_popup = False
+                            st.rerun()
+                        else:
+                            st.error(result["message"])
+                    except Exception as e:
+                        st.error(f"Erreur inattendue : {str(e)}")
+                    finally:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+        if st.button("Fermer", key="popup_close"):
+            st.session_state.show_upload_popup = False
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# Colonnes principales
+col1, col2, col3 = st.columns([1, 3, 1])
+
+if st.session_state.dark_mode:
+    st.markdown('<div class="dark-mode">', unsafe_allow_html=True)
+
+with col1:
+    st.subheader("📜 Historique")
+    with st.container():
+        st.markdown('<div class="history-container">', unsafe_allow_html=True)
+        if not st.session_state.history:
+            st.info("Aucune conversation pour le moment.")
+        else:
+            for i, chat in enumerate(st.session_state.history[-10:]):
+                with st.expander(f"{chat['query'][:30]}...", expanded=False):
+                    st.markdown(f"**Vous** : {chat['query']}")
+                    st.markdown(f"**Bot** : {chat['response']}")
+                    if "context" in chat:
+                        st.markdown("**Contexte** :")
+                        for doc in chat["context"]:
+                            st.write(f"- {doc['text'][:50]}... (Score: {doc['distance']:.2f}, Domaine: {doc['metadata'].get('domaine', 'N/A')}, Thème: {doc['metadata'].get('theme', 'N/A')}, Fichier: {doc['metadata'].get('filename', 'N/A')})")
+                    if st.button("🗑️ Supprimer", key=f"del_history_{i}"):
+                        st.session_state.history.pop(-10 + i)
+                        st.rerun()
+                st.markdown("---")
+        st.markdown('</div>', unsafe_allow_html=True)
+    if st.session_state.history and st.button("📥 Exporter l'historique"):
+        st.download_button(
+            label="Télécharger",
+            data=json.dumps(st.session_state.history, ensure_ascii=False),
+            file_name="chat_history.json",
+            mime="application/json"
+        )
+
+with col2:
+    st.subheader("💬 Conversation")
+    with st.container():
+        st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+        if not st.session_state.history:
+            st.info("Aucune conversation pour le moment.")
+        else:
+            for i, chat in enumerate(st.session_state.history[-10:]):
+                # Message utilisateur avec avatar
+                message(chat["query"], is_user=True, key=f"user_{i}", avatar_style="big-ears")
+                # Message bot avec contexte et avatar
+                response_with_context = f"{chat['response']}\n\n**Contexte**:\n{'\n'.join([f'- {doc['text'][:50]}... (Score: {doc['distance']:.2f}, Domaine: {doc['metadata'].get('domaine', 'N/A')}, Thème: {doc['metadata'].get('theme', 'N/A')})' for doc in chat['context']]) if 'context' in chat else 'Aucun contexte'}"
+                message(response_with_context, is_user=False, key=f"bot_{i}", avatar_style="bottts")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with st.form(key="chat_form", clear_on_submit=True):
+        query = st.text_input("Entrez votre question :", placeholder="Ex. : Quelles sont les dates importantes ?")
+        
+        # Filtres avec les domaines et thèmes de ChromaDB (sans fichier)
+        st.markdown("**Filtrer par :**")
+        col_filter1, col_filter2 = st.columns(2)  # Réduit à 2 colonnes sans "Fichier"
+        with col_filter1:
+            selected_domaine = st.selectbox("Domaine :", ["Tous"] + unique_domains, key="filter_domaine")
+        with col_filter2:
+            selected_theme = st.selectbox("Thème :", ["Tous"] + unique_themes, key="filter_theme")
+        
+        submit_button = st.form_submit_button("🚀 Envoyer", type="primary")
+
+    if (submit_button or query.strip()) and query and query != st.session_state.last_query:
+        st.session_state.last_query = query
+        with st.spinner("Réponse en cours de génération..."):
+            result = chat_with_bot(query, st.session_state.model)
+            response = result.get("response", "Erreur : aucune réponse reçue")
+            context = result.get("context", [])
+
+            # Filtrer les informations selon les choix de l'utilisateur (sans fichier)
+            filtered_info = ""
+            if selected_domaine != "Tous" or selected_theme != "Tous":
+                filtered_info = "\n\nRésultats filtrés :\n"
+                all_docs = collection.get(include=["metadatas"])
+                for metadata in all_docs["metadatas"]:
+                    if (selected_domaine == "Tous" or metadata.get("domaine") == selected_domaine) and \
+                       (selected_theme == "Tous" or metadata.get("theme") == selected_theme):
+                        filtered_info += f"- Fichier: {metadata.get('filename', 'Inconnu')}, Domaine: {metadata.get('domaine', 'N/A')}, Thème: {metadata.get('theme', 'N/A')}\n"
+                if not filtered_info.strip().endswith(":"):
+                    response += filtered_info
+                else:
+                    response += "\n\nAucun fichier ne correspond aux filtres sélectionnés."
+
+            st.session_state.history.append({"query": query, "response": response, "context": context})
+            st.rerun()
+
+with col3:
+    st.subheader("⚙️ Paramètres")
+    models = ["qwen2.5:3b", "llama3.2:latest", "deepseek-r1:1.5b", "qwen2:1.5b"]
+    selected_model = st.selectbox("Modèle :", models)
+    if selected_model != st.session_state.model:
+        st.session_state.model = selected_model
+        st.rerun()
+
+    dark_mode = st.checkbox("Mode sombre", value=st.session_state.dark_mode)
+    if dark_mode != st.session_state.dark_mode:
+        st.session_state.dark_mode = dark_mode
+        st.rerun()
+
+    if st.button("🗑️ Réinitialiser"):
+        st.session_state.history = []
+        st.success("Historique réinitialisé !")
+        st.rerun()
+
+if st.session_state.dark_mode:
+    st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown("---")
+st.caption("RAG réalisé par H. Sami • Date : 23 février 2025")
